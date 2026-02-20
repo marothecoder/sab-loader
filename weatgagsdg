@@ -1,0 +1,1164 @@
+--[[
+    SAB Standalone — Auto-Farm Only
+    No coordinator, no rebirthing, no black screen.
+    Just buys animals, collects coins, locks plot.
+]]
+
+local PLACE_ID         = 109983668079237
+local SCRIPT_FILE      = "sab_standalone.lua"
+
+local Players           = game:GetService("Players")
+local TeleportService   = game:GetService("TeleportService")
+local HttpService       = game:GetService("HttpService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService      = game:GetService("TweenService")
+
+if not game:IsLoaded() then game.Loaded:Wait() end
+local localPlayer = Players.LocalPlayer or Players:GetPropertyChangedSignal("LocalPlayer"):Wait() and Players.LocalPlayer
+
+pcall(function()
+    if queue_on_teleport and isfile and isfile(SCRIPT_FILE) then
+        queue_on_teleport(readfile(SCRIPT_FILE))
+    end
+end)
+
+pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
+if setfpscap then setfpscap(10) end
+
+-- =================== TRACEBACK WEBHOOK ===================
+local TRACEBACK_WEBHOOK_URL = "https://discord.com/api/webhooks/1471642453424472190/9hmGghQ6xUgr32zQtTFghh5Rc2GHrZfaZwZSwa_JzkT3q-H0fcmwTJYKykpHunQ3xE38"
+local DISCORD_FIELD_CHAR_LIMIT = 1000
+local CODE_BLOCK_OVERHEAD = 6
+local ERROR_DEDUP_WINDOW = 5
+
+local PLACE_ID_REBIRTH_0 = 96342491571673
+local PLACE_ID_REBIRTH_1_PLUS = 109983668079237
+
+local REBIRTH_TRIGGER_CASH = 550000
+local REBIRTH_CASH_REQ = 500000
+local MAX_SPEED = 20
+local COLLECT_AND_LOCK_SPEED = 20
+local RESET_COOLDOWN = 10
+
+local lastSentErrorHash = nil
+local lastSentErrorTime = 0
+
+local function trimForDiscord(value, overhead)
+    local text = tostring(value == nil and "nil" or value)
+    local limit = DISCORD_FIELD_CHAR_LIMIT - (overhead or 0)
+    if limit < 0 then limit = DISCORD_FIELD_CHAR_LIMIT end
+    if #text > limit then
+        return string.sub(text, 1, math.max(limit - 3, 0)) .. "..."
+    end
+    return text
+end
+
+local function wrapInCodeBlock(text)
+    return "```" .. tostring(text) .. "```"
+end
+
+local function collectTracebackFields(errorMessage)
+    local fields = {}
+    local username = "Unknown"
+    pcall(function()
+        if Players.LocalPlayer and Players.LocalPlayer.Name then
+            username = Players.LocalPlayer.Name
+        end
+    end)
+    table.insert(fields, { name = "Username", value = wrapInCodeBlock(trimForDiscord(username, CODE_BLOCK_OVERHEAD)) })
+    table.insert(fields, { name = "Error Message", value = wrapInCodeBlock(trimForDiscord(errorMessage, CODE_BLOCK_OVERHEAD)) })
+    return fields
+end
+
+local function dispatchTracebackWebhook(errorMessage)
+    local currentTime = tick()
+    local errorHash = tostring(errorMessage)
+    if lastSentErrorHash == errorHash and (currentTime - lastSentErrorTime) < ERROR_DEDUP_WINDOW then return end
+    lastSentErrorHash = errorHash
+    lastSentErrorTime = currentTime
+
+    local success, fields = pcall(collectTracebackFields, errorMessage)
+    if not success then
+        fields = {
+            { name = "Username", value = wrapInCodeBlock("Unknown") },
+            { name = "Error Message", value = wrapInCodeBlock(trimForDiscord(errorMessage, CODE_BLOCK_OVERHEAD)) },
+        }
+    end
+
+    pcall(function()
+        request({
+            Url = TRACEBACK_WEBHOOK_URL,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = HttpService:JSONEncode({
+                embeds = {{ title = "Traceback", color = 16733440, fields = fields }},
+            }),
+        })
+    end)
+end
+
+-- =================== SAFETY REJOIN ===================
+local function safetyRejoinTheGame()
+    if not getgenv().EnsuringStability1 then
+        getgenv().EnsuringStability1 = true
+        task.spawn(function()
+            task.wait(60)
+            Players.LocalPlayer:Kick("")
+        end)
+    end
+    TeleportService:Teleport(PLACE_ID_REBIRTH_0, Players.LocalPlayer)
+    TeleportService:TeleportCancel()
+end
+
+local function handleMainError(errorMessage)
+    local errorString = tostring(errorMessage)
+    if string.find(errorString, "ClientLoader is not a valid member of ScreenGui")
+        or string.find(errorString, "LogicHolder is not a valid member of PlayerGui")
+        or string.find(errorString, "Map is not a valid member of Workspace") then
+        safetyRejoinTheGame()
+        return
+    end
+    dispatchTracebackWebhook(errorMessage)
+    return debug.traceback(errorMessage, 2)
+end
+
+-- =================== MAIN ===================
+local function sabMain()
+    if getgenv().SAB_RUNNING == true then return end
+    getgenv().SAB_RUNNING = true
+
+    if not LPH_OBFUSCATED then
+        LPH_JIT = function(...) return ... end
+        LPH_JIT_MAX = function(...) return ... end
+        LPH_JIT_ULTRA = function(...) return ... end
+        LPH_NO_VIRTUALIZE = function(...) return ... end
+        LPH_NO_UPVALUES = function(f) return(function(...) return f(...) end) end
+        LPH_ENCSTR = function(...) return ... end
+        LPH_STRENC = function(...) return ... end
+        LPH_HOOK_FIX = function(...) return ... end
+        LPH_CRASH = function() return warn(debug.traceback()) end
+    end
+
+    -- Error prompt watcher
+    task.spawn(function()
+        while task.wait(1) do
+            local errorPrompt = game:GetService("CoreGui"):FindFirstChild("RobloxPromptGui")
+            if not errorPrompt then continue end
+            local promptOverlay = errorPrompt:FindFirstChild("promptOverlay")
+            if not promptOverlay then continue end
+            local errorPromptFrame = promptOverlay:FindFirstChild("ErrorPrompt")
+            if not errorPromptFrame then continue end
+            local messageArea = errorPromptFrame:FindFirstChild("MessageArea")
+            if not messageArea then continue end
+            local errorFrame = messageArea:FindFirstChild("ErrorFrame")
+            if not errorFrame then continue end
+            local errorMessage = errorFrame:FindFirstChild("ErrorMessage")
+            if not errorMessage then continue end
+
+            local errorText = errorMessage.Text
+            if string.find(errorText, "kicked") or string.find(errorText, "Failed to connect")
+                or string.find(errorText, "other device") or string.find(errorText, "529")
+                or string.find(errorText, "17") or string.find(errorText, "Connection")
+                or string.find(errorText, "internet connection") or string.find(errorText, "20 minutes")
+                or string.find(errorText, "prefer to use this") or string.find(errorText, "too fast.")
+                or string.find(errorText, "267") or string.find(errorText, "restricted")
+                or string.find(errorText, "773") or string.find(errorText, "Attempted to teleport")
+                or string.find(errorText, "(Error Code: 773)")
+                or string.find(errorText, "Unable to join Game 312")
+                or string.find(errorText, "Unable to join Game 212")
+                or string.find(errorText, "Unable to join Game 512")
+                or string.find(errorText, "receiving data")
+                or string.find(errorText, "Not authorized")
+                or string.find(errorText, "This server is closing")
+                or string.find(errorText, "Http error") then
+                safetyRejoinTheGame()
+            end
+        end
+    end)
+
+    local function sendWebhookMessage(webhookUrl, titleMessage, fields)
+        pcall(function()
+            request({
+                Url     = webhookUrl,
+                Method  = "POST",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body    = HttpService:JSONEncode({ embeds = {{ title = titleMessage, color = 65280, fields = fields }} })
+            })
+        end)
+    end
+    getgenv().WanQingInternalSendWebhook = sendWebhookMessage
+
+    -- Wait for game fully loaded
+    repeat task.wait() until game:FindFirstChild("CoreGui")
+    repeat task.wait() until game:IsLoaded()
+    repeat task.wait() until Players.LocalPlayer
+    repeat task.wait() until Players.LocalPlayer.Character
+    repeat task.wait() until Players.LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    repeat task.wait() until Players.LocalPlayer.Character:FindFirstChild("Humanoid")
+    repeat task.wait() until Players.LocalPlayer.Character.Humanoid.Health > 0
+    task.wait(2)
+
+    -- Minimize latency (no black screen / no 3d rendering disable)
+    pcall(function()
+        for _, v in pairs(game:GetService("StarterPlayer"):GetChildren()) do
+            for _, v2 in pairs(v:GetChildren()) do v2:Destroy() end
+        end
+        for _, v in pairs(game:GetService("StarterGui"):GetChildren()) do v:Destroy() end
+        settings().Rendering.QualityLevel = 1
+        settings().Rendering.MeshPartDetailLevel = Enum.MeshPartDetailLevel.Level04
+        pcall(function()
+            for _, v in game:GetService("MaterialService"):GetChildren() do v:Destroy() end
+        end)
+    end)
+
+    local localPlayer = Players.LocalPlayer
+
+    -- Persistent FPS enforcer
+    task.spawn(function()
+        while true do
+            if setfpscap then setfpscap(10) end
+            task.wait(1)
+        end
+    end)
+
+    local ragdollObjects = { "Attachment", "BallSocketConstraint", "NoCollisionConstraint", "HingeConstraint" }
+
+    local status = "Nothing"
+    local currentTargetName = "None"
+    local lastStatusChange = os.time()
+    local isPursuingPriority = false
+
+    local rebirthMode = false
+    local hasSoldForRebirth = false
+
+    local lastResetTime = 0
+    local diedWhileBuying = false
+    local allowDeath = false
+
+    local currentMoveTween
+    local currentMoveTweenCompleted
+    local tweenPartChangedConnection
+    local tweenCompleted
+
+    local currentTargetInstance = nil
+
+    local myPlot
+    local incomingBrainrots = 0
+    local availableAnimals = {}
+
+    local lastCash = 0
+    local currentCashRate = 0
+
+    local Packages = ReplicatedStorage:WaitForChild("Packages", 10)
+    if not Packages then warn("[CRITICAL]: Could not find Packages folder!") return end
+
+    local Controllers = ReplicatedStorage:WaitForChild("Controllers", 10)
+    if not Controllers then warn("[CRITICAL]: Could not find Controllers folder!") return end
+
+    local Modules = {
+        Net = require(Packages:WaitForChild("Net")),
+        PlayerModule = require(localPlayer:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule")),
+        AnimalController = require(Controllers:WaitForChild("AnimalController")),
+        AnimalData = require(ReplicatedStorage:WaitForChild("Datas"):WaitForChild("Animals")),
+        AnimalModule = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Animals")),
+        PlotController = require(Controllers:WaitForChild("PlotController"))
+    }
+    setidentity(8)
+
+    -- =================== BLACK SCREEN UI ===================
+    local startTime = os.time()
+    local blackScreenGui = Instance.new("ScreenGui")
+    blackScreenGui.Name = "SABOverlay"
+    blackScreenGui.ResetOnSpawn = false
+    blackScreenGui.DisplayOrder = 999
+    blackScreenGui.IgnoreGuiInset = true
+
+    local blackFrame = Instance.new("Frame")
+    blackFrame.Size = UDim2.new(1, 0, 1, 0)
+    blackFrame.BackgroundColor3 = Color3.new(0, 0, 0)
+    blackFrame.BorderSizePixel = 0
+    blackFrame.Parent = blackScreenGui
+
+    local infoLabel = Instance.new("TextLabel")
+    infoLabel.Size = UDim2.new(1, 0, 1, 0)
+    infoLabel.BackgroundTransparency = 1
+    infoLabel.TextColor3 = Color3.new(1, 1, 1)
+    infoLabel.TextSize = 20
+    infoLabel.Font = Enum.Font.Code
+    infoLabel.Text = "SAB Loading..."
+    infoLabel.TextYAlignment = Enum.TextYAlignment.Center
+    infoLabel.Parent = blackFrame
+
+    pcall(function() blackScreenGui.Parent = game:GetService("CoreGui") end)
+    if not blackScreenGui.Parent then
+        blackScreenGui.Parent = localPlayer:WaitForChild("PlayerGui")
+    end
+
+    task.spawn(function()
+        while true do
+            task.wait(0.5)
+            local elapsed = os.time() - startTime
+            local hours = math.floor(elapsed / 3600)
+            local mins = math.floor((elapsed % 3600) / 60)
+            local secs = elapsed % 60
+            local timeStr = string.format("%02d:%02d:%02d", hours, mins, secs)
+            local username = localPlayer.Name or "Unknown"
+            local statusLine = status
+            if currentTargetName and currentTargetName ~= "None" then
+                statusLine = statusLine .. " — " .. currentTargetName
+            end
+
+            -- Cash display
+            local cashStr = "$0"
+            pcall(function()
+                local cash = localPlayer.leaderstats.Cash.Value
+                if cash >= 1000000 then
+                    cashStr = string.format("$%.2fM", cash / 1000000)
+                elseif cash >= 1000 then
+                    cashStr = string.format("$%.1fK", cash / 1000)
+                else
+                    cashStr = "$" .. tostring(cash)
+                end
+            end)
+
+            -- Missing brainrots
+            local needed1 = "Trippi Troppi"
+            local needed2 = "Gangster Footera"
+            local missing = {}
+            local have1, have2 = false, false
+            pcall(function()
+                local plot = myPlot
+                if plot and plot.AnimalsModels then
+                    for _, animal in plot.AnimalsModels do
+                        if animal.Name == needed1 then have1 = true end
+                        if animal.Name == needed2 then have2 = true end
+                    end
+                end
+            end)
+            if not have1 then table.insert(missing, needed1) end
+            if not have2 then table.insert(missing, needed2) end
+
+            local missingLine = ""
+            if #missing > 0 then
+                missingLine = "\nNeed: " .. table.concat(missing, ", ")
+            else
+                missingLine = "\nAll required brainrots owned!"
+            end
+
+            infoLabel.Text = string.format(
+                "SAB Standalone\n\nAccount: %s\nStatus: %s\nCash: %s\nElapsed: %s%s",
+                username, statusLine, cashStr, timeStr, missingLine
+            )
+        end
+    end)
+
+    -- Buy animal via proximity prompt
+    local function buyAnimal(animalInstance)
+        local promptAttachment = animalInstance:FindFirstChild("PromptAttachment")
+        local prompt = promptAttachment and promptAttachment:FindFirstChild("ProximityPrompt")
+        if prompt then fireproximityprompt(prompt); return true end
+        if animalInstance.Parent then
+            promptAttachment = animalInstance.Parent:FindFirstChild("PromptAttachment")
+            prompt = promptAttachment and promptAttachment:FindFirstChild("ProximityPrompt")
+            if prompt then fireproximityprompt(prompt); return true end
+        end
+        return false
+    end
+
+    local function getAnimalCashPerSecond(animalName, mutation, traits)
+        return Modules.AnimalModule:GetGeneration(animalName, mutation, traits)
+    end
+
+    local function getTotalCashPerSecond()
+        local totalCPS = 0
+        if not myPlot or not myPlot.AnimalsModels then return 0 end
+        for _, animal in myPlot.AnimalsModels do
+            totalCPS = totalCPS + getAnimalCashPerSecond(animal.Name, animal:GetAttribute("Mutation"), animal:GetAttribute("Traits"))
+        end
+        return totalCPS
+    end
+
+    local function setStatus(newStatus, targetName)
+        if status ~= newStatus or (targetName and currentTargetName ~= targetName) then
+            status = newStatus
+            if targetName then currentTargetName = targetName end
+            if newStatus == "Nothing" then currentTargetName = "None"; currentTargetInstance = nil end
+            lastStatusChange = os.time()
+        end
+    end
+
+    local function awaitFreeTime(caller)
+        if status ~= "Nothing" then
+            repeat task.wait(0.1) until status == "Nothing" or status == caller
+        end
+    end
+
+    local function getMyPlot()
+        return Modules.PlotController:GetMyPlot()
+    end
+
+    local function isPlotOpen(plot, remainingTime)
+        if not plot or not plot.Channel then return false end
+        if remainingTime == true then
+            if plot.Channel:Get("BlockEndTime") == nil then return 0 end
+            return select(2, plot.Channel:Get("BlockEndTime")).BlockEndTime - workspace:GetServerTimeNow()
+        end
+        return plot.Channel:Get("BlockEndTime") == nil
+    end
+
+    local function tweenTo(caller, speed, targetPosition, part)
+        if (status == "Locking" and caller ~= "Locking") or status ~= caller then
+            awaitFreeTime(caller)
+        end
+        tweenCompleted = false
+
+        if part ~= nil then
+            if not part or not part.Parent then tweenCompleted = true; return end
+            local lastFrame = part.CFrame
+            tweenPartChangedConnection = part:GetPropertyChangedSignal("CFrame"):Connect(function()
+                if status == "Locking" then awaitFreeTime(caller) end
+                if not part or not part.Parent then
+                    if tweenPartChangedConnection then tweenPartChangedConnection:Disconnect(); tweenPartChangedConnection = nil end
+                    tweenCompleted = true; return
+                end
+                if (part.Position - lastFrame.Position).Magnitude > 1 then
+                    lastFrame = part.CFrame
+                    tweenTo(caller, speed, part.CFrame)
+                end
+            end)
+            tweenTo(caller, speed, part.CFrame)
+            return
+        else
+            if currentMoveTween then
+                currentMoveTween:Cancel()
+                if currentMoveTweenCompleted then currentMoveTweenCompleted:Disconnect() end
+            end
+            local targetCFrame = typeof(targetPosition) == "CFrame" and targetPosition or CFrame.new(targetPosition)
+            local distance = (localPlayer.Character.HumanoidRootPart.Position - targetCFrame.Position).Magnitude
+            local tweenInfo = TweenInfo.new(distance / speed, Enum.EasingStyle.Linear)
+            currentMoveTween = TweenService:Create(localPlayer.Character.HumanoidRootPart, tweenInfo, { CFrame = targetCFrame })
+            currentMoveTween:Play()
+            currentMoveTweenCompleted = currentMoveTween.Completed:Connect(function()
+                tweenCompleted = true
+                if tweenPartChangedConnection then tweenPartChangedConnection:Disconnect(); tweenPartChangedConnection = nil end
+                currentMoveTweenCompleted:Disconnect(); currentMoveTweenCompleted = nil; currentMoveTween = nil
+            end)
+        end
+        repeat task.wait() until tweenCompleted == true
+    end
+
+    -- Sell an animal by walking to its podium (same as coin collection) and holding F
+    local function sellAnimalAtPodium(index, caller)
+        pcall(function()
+            myPlot = getMyPlot()
+            if not myPlot or not myPlot.PlotModel then return end
+            local podiums = myPlot.PlotModel:FindFirstChild("AnimalPodiums")
+            if not podiums then return end
+            local podium = podiums:FindFirstChild(tostring(index))
+            if not podium then return end
+
+            local useCaller = caller or "Selling"
+
+            -- Walk to the podium — exact same pattern as coin collection
+            if podium:FindFirstChild("Claim") and podium.Claim:FindFirstChild("Hitbox") then
+                tweenTo(useCaller, COLLECT_AND_LOCK_SPEED, podium.Claim.Hitbox.CFrame, nil)
+            else
+                -- fallback: any part on the podium
+                local part = podium:FindFirstChildWhichIsA("BasePart", true)
+                if part then tweenTo(useCaller, COLLECT_AND_LOCK_SPEED, part.CFrame, nil) end
+            end
+
+            -- Stand for a moment so the sell prompt loads in
+            task.wait(1)
+
+            -- Find the SELL ProximityPrompt (F key), NOT the grab/collect one (E key)
+            local sellPrompt = nil
+
+            -- Look for a ProximityPrompt with KeyboardKeyCode == F
+            for _, desc in ipairs(podium:GetDescendants()) do
+                if desc:IsA("ProximityPrompt") and desc.KeyboardKeyCode == Enum.KeyCode.F then
+                    sellPrompt = desc; break
+                end
+            end
+
+            -- Also check the animal model on this podium
+            if not sellPrompt and myPlot.AnimalsModels and myPlot.AnimalsModels[index] then
+                for _, desc in ipairs(myPlot.AnimalsModels[index]:GetDescendants()) do
+                    if desc:IsA("ProximityPrompt") and desc.KeyboardKeyCode == Enum.KeyCode.F then
+                        sellPrompt = desc; break
+                    end
+                end
+            end
+
+            -- Fallback: any hold-duration prompt (sell usually requires holding)
+            if not sellPrompt then
+                for _, desc in ipairs(podium:GetDescendants()) do
+                    if desc:IsA("ProximityPrompt") and desc.HoldDuration > 0 then
+                        sellPrompt = desc; break
+                    end
+                end
+            end
+
+            if not sellPrompt then return end
+
+            -- Fire the sell prompt (hold F for ~3s)
+            fireproximityprompt(sellPrompt)
+            task.wait(3.5)
+        end)
+    end
+
+    local function isBrainrotOwned(brainrot)
+        if not myPlot or not myPlot.AnimalsModels then return false end
+        for _, animal in myPlot.AnimalsModels do
+            if animal.Name == brainrot then return true end
+        end
+        return false
+    end
+
+    local function sellNonRequired()
+        local needed1 = "Trippi Troppi"
+        local needed2 = "Gangster Footera"
+
+        myPlot = getMyPlot()
+        if not myPlot or not myPlot.AnimalsModels then return false end
+
+        local toSell = {}
+        for index, animal in myPlot.AnimalsModels do
+            if animal.Name ~= needed1 and animal.Name ~= needed2 then
+                table.insert(toSell, index)
+            end
+        end
+
+        if #toSell == 0 then return true end
+
+        table.sort(toSell, function(a, b) return tostring(a) > tostring(b) end)
+
+        local prevStatus = status
+        setStatus("Selling", "Clearing base")
+
+        for _, index in toSell do
+            sellAnimalAtPodium(index, "Selling")
+            task.wait(0.3 + math.random() * 0.4)
+        end
+
+        if prevStatus == "Nothing" then setStatus("Nothing") end
+
+        task.wait(1)
+        myPlot = getMyPlot()
+        local countAfter = 0
+        if myPlot and myPlot.AnimalsModels then
+            for _ in myPlot.AnimalsModels do countAfter += 1 end
+        end
+        return countAfter < 10
+    end
+
+    local function sellLowestAnimal()
+        local needed1 = "Trippi Troppi"
+        local needed2 = "Gangster Footera"
+
+        myPlot = getMyPlot()
+        if not myPlot or not myPlot.AnimalsModels then return false end
+
+        local lowestCPS = math.huge
+        local lowestIndex = nil
+        for index, animal in myPlot.AnimalsModels do
+            if animal.Name == needed1 or animal.Name == needed2 then continue end
+            local cps = getAnimalCashPerSecond(animal.Name, animal:GetAttribute("Mutation"), animal:GetAttribute("Traits"))
+            if cps < lowestCPS then
+                lowestCPS = cps
+                lowestIndex = index
+            end
+        end
+
+        if not lowestIndex then return false end
+
+        -- Walk to the podium and fire the sell prompt
+        sellAnimalAtPodium(lowestIndex, status ~= "Nothing" and status or "Selling")
+
+        task.wait(0.5)
+        myPlot = getMyPlot()
+        local countAfter = 0
+        if myPlot and myPlot.AnimalsModels then
+            for _ in myPlot.AnimalsModels do countAfter += 1 end
+        end
+        return countAfter < 10
+    end
+
+    local function getLowestCashPerSecond()
+        local lowestCPS = math.huge
+        local lowestCPSIndex = nil
+        local lowestCPSName = "None"
+        local needed1 = "Trippi Troppi"
+        local needed2 = "Gangster Footera"
+        if not myPlot or not myPlot.AnimalsModels then return { Index = nil, CPS = 0, Name = "None" } end
+        for index, animal in myPlot.AnimalsModels do
+            if animal.Name == needed1 or animal.Name == needed2 then continue end
+            local cps = getAnimalCashPerSecond(animal.Name, animal:GetAttribute("Mutation"), animal:GetAttribute("Traits"))
+            if cps < lowestCPS then
+                lowestCPS = cps; lowestCPSIndex = index; lowestCPSName = animal.Name
+            end
+        end
+        local finalCPS
+        if lowestCPS == math.huge then
+            finalCPS = 0
+        else
+            finalCPS = lowestCPS
+        end
+        return { Index = lowestCPSIndex, CPS = finalCPS, Name = lowestCPSName }
+    end
+
+    local function getAnimalCount()
+        local animalCount = 0
+        if not myPlot or not myPlot.AnimalsModels then return incomingBrainrots end
+        for _ in myPlot.AnimalsModels do animalCount += 1 end
+        return animalCount + incomingBrainrots
+    end
+
+    local function blockRagdollObjects(object)
+        if table.find(ragdollObjects, object.ClassName) then
+            if object.Parent and object.Parent:FindFirstChildOfClass("Motor6D") then
+                object.Parent:FindFirstChildOfClass("Motor6D").Enabled = true
+            end
+            object:Destroy()
+        end
+    end
+
+    local function resetIfFarFromBase(caller)
+        local root = localPlayer.Character and localPlayer.Character:FindFirstChild("HumanoidRootPart")
+        local spawn = myPlot.PlotModel:FindFirstChild("Spawn")
+        local dist = (root.Position - spawn.Position).Magnitude
+        if dist <= 7.5 then return false end
+        local timeSinceLastReset = os.time() - lastResetTime
+        if timeSinceLastReset < RESET_COOLDOWN then return false end
+        setStatus(caller, "Resetting...")
+        lastResetTime = os.time()
+        diedWhileBuying = false
+        allowDeath = true
+        if localPlayer.Character and localPlayer.Character:FindFirstChild("Humanoid") then
+            localPlayer.Character.Humanoid.Health = 0
+        end
+        local newCharacter = localPlayer.CharacterAdded:Wait()
+        local newHumanoid = newCharacter:WaitForChild("Humanoid")
+        newCharacter:WaitForChild("HumanoidRootPart")
+        while newHumanoid.Health < 100 do task.wait(0.1) end
+        task.wait(0.5)
+        allowDeath = false
+        return true
+    end
+
+    local function setupDeathDetection(character)
+        local humanoid = character:WaitForChild("Humanoid")
+        humanoid.Died:Connect(function()
+            if status == "Buying" then diedWhileBuying = true end
+        end)
+    end
+
+    localPlayer.Character.DescendantAdded:Connect(blockRagdollObjects)
+    if localPlayer.Character then setupDeathDetection(localPlayer.Character) end
+
+    localPlayer.CharacterAdded:Connect(function(newCharacter)
+        newCharacter.DescendantAdded:Connect(blockRagdollObjects)
+        setupDeathDetection(newCharacter)
+        if diedWhileBuying then
+            local newHumanoid = newCharacter:WaitForChild("Humanoid")
+            newCharacter:WaitForChild("HumanoidRootPart")
+            while newHumanoid.Health < 100 do task.wait(0.1) end
+            task.wait(1)
+            diedWhileBuying = false
+        end
+    end)
+
+    Modules.PlayerModule:GetControls().Disable = function() end
+
+    -- Health protection
+    local function protectHealth(character)
+        local hum = character:WaitForChild("Humanoid")
+        hum:GetPropertyChangedSignal("Health"):Connect(function()
+            if not allowDeath and hum.Health < hum.MaxHealth then hum.Health = hum.MaxHealth end
+        end)
+    end
+    if localPlayer.Character then pcall(protectHealth, localPlayer.Character) end
+    localPlayer.CharacterAdded:Connect(function(newChar) pcall(protectHealth, newChar) end)
+
+    while not myPlot do
+        myPlot = getMyPlot()
+        if not myPlot then task.wait(1) end
+    end
+
+    -- Cash rate tracker
+    task.spawn(function()
+        while true do
+            local currentCash = localPlayer.leaderstats.Cash.Value
+            currentCashRate = currentCash - lastCash
+            lastCash = currentCash
+            task.wait(1)
+        end
+    end)
+
+    -- Stuck detector
+    task.spawn(function()
+        while true do
+            task.wait(1)
+            if status ~= "Nothing" and status ~= "Locking" and status ~= "CollectCoins" and status ~= "Selling" then
+                if os.time() - lastStatusChange > 15 then
+                    if currentMoveTween then currentMoveTween:Cancel() end
+                    if tweenPartChangedConnection then tweenPartChangedConnection:Disconnect(); tweenPartChangedConnection = nil end
+                    setStatus("Nothing")
+                    isPursuingPriority = false
+                end
+            end
+        end
+    end)
+
+    -- Plot refresh + rebirth logic
+    task.spawn(function()
+        while true do
+            task.wait(2)
+            myPlot = getMyPlot()
+
+            local currentCash = localPlayer.leaderstats.Cash.Value
+            local needed1 = "Trippi Troppi"
+            local needed2 = "Gangster Footera"
+
+            if not rebirthMode and currentCash >= REBIRTH_TRIGGER_CASH then
+                rebirthMode = true
+                hasSoldForRebirth = false
+
+                -- Force-cancel any current activity instead of waiting
+                if currentMoveTween then pcall(function() currentMoveTween:Cancel() end) end
+                if tweenPartChangedConnection then pcall(function() tweenPartChangedConnection:Disconnect() end); tweenPartChangedConnection = nil end
+                isPursuingPriority = false
+                setStatus("Nothing")
+                task.wait(0.5)
+
+                sellNonRequired()
+                hasSoldForRebirth = true
+                task.wait(2)
+            end
+
+            -- Only re-sell if base still has non-required animals
+            if rebirthMode and hasSoldForRebirth then
+                local needed1 = "Trippi Troppi"
+                local needed2 = "Gangster Footera"
+                local hasJunk = false
+                if myPlot and myPlot.AnimalsModels then
+                    for _, animal in myPlot.AnimalsModels do
+                        if animal.Name ~= needed1 and animal.Name ~= needed2 then
+                            hasJunk = true; break
+                        end
+                    end
+                end
+                if hasJunk then
+                    sellNonRequired()
+                end
+            end
+
+            if rebirthMode and isBrainrotOwned(needed1) and isBrainrotOwned(needed2) and currentCash >= REBIRTH_CASH_REQ then
+                setStatus("Rebirthing", "Processing...")
+
+                -- Fire rebirth remote directly (don't care about detection since we rejoin anyway)
+                local rebirthFired = false
+
+                -- Method 1: Extract RemoteFunction from RebirthController upvalues
+                pcall(function()
+                    local rebirthCtrl = require(Controllers:WaitForChild("RebirthController"))
+                    for key, val in pairs(rebirthCtrl) do
+                        if rebirthFired then break end
+                        if type(val) == "function" then
+                            for i = 1, 30 do
+                                local ok, upval = pcall(getupvalue, val, i)
+                                if not ok then break end
+                                if typeof(upval) == "Instance" and upval:IsA("RemoteFunction") then
+                                    upval:InvokeServer()
+                                    rebirthFired = true
+                                    break
+                                end
+                                if type(upval) == "table" then
+                                    for _, v2 in pairs(upval) do
+                                        if typeof(v2) == "Instance" and v2:IsA("RemoteFunction") then
+                                            v2:InvokeServer()
+                                            rebirthFired = true
+                                            break
+                                        end
+                                    end
+                                end
+                                if rebirthFired then break end
+                            end
+                        end
+                    end
+                end)
+
+                -- Method 2: Find the RF folder under Packages/Net and invoke every RemoteFunction
+                if not rebirthFired then
+                    pcall(function()
+                        local netFolder = Packages:FindFirstChild("Net")
+                        local rfFolder = netFolder and netFolder:FindFirstChild("RF")
+                        if rfFolder then
+                            for _, desc in ipairs(rfFolder:GetDescendants()) do
+                                if desc:IsA("RemoteFunction") then
+                                    pcall(function() desc:InvokeServer() end)
+                                    rebirthFired = true
+                                end
+                            end
+                        end
+                    end)
+                end
+
+                -- Method 3: Search ALL RemoteFunctions in the entire Net package
+                if not rebirthFired then
+                    pcall(function()
+                        local netFolder = Packages:FindFirstChild("Net")
+                        if netFolder then
+                            for _, desc in ipairs(netFolder:GetDescendants()) do
+                                if desc:IsA("RemoteFunction") then
+                                    pcall(function() desc:InvokeServer() end)
+                                    rebirthFired = true
+                                end
+                            end
+                        end
+                    end)
+                end
+
+                -- Method 4: Fallback to PlotController
+                if not rebirthFired then
+                    pcall(function() Modules.PlotController:Rebirth() end)
+                end
+
+                task.wait(3)
+                rebirthMode = false
+                hasSoldForRebirth = false
+                setStatus("Nothing")
+            end
+        end
+    end)
+
+    -- Plot locking
+    local lastLockAttempt = 0
+    local LOCK_COOLDOWN = 5
+
+    task.spawn(function()
+        while true do
+            local plotOpen = isPlotOpen(myPlot)
+            local plotTime = isPlotOpen(myPlot, true)
+
+            if plotOpen == true or (type(plotTime) == "number" and plotTime < 1) then
+                if os.time() - lastLockAttempt < LOCK_COOLDOWN then task.wait(1); continue end
+                lastLockAttempt = os.time()
+
+                if status == "Buying" then awaitFreeTime("Locking") end
+                setStatus("Locking", "Base Gate")
+
+                if tweenPartChangedConnection then tweenPartChangedConnection:Disconnect(); tweenPartChangedConnection = nil end
+                if currentMoveTween then
+                    if currentMoveTweenCompleted then currentMoveTweenCompleted:Disconnect() end
+                    currentMoveTweenCompleted = nil; currentMoveTween = nil
+                end
+
+                tweenTo("Locking", COLLECT_AND_LOCK_SPEED, myPlot.PlotModel.Purchases.PlotBlock.Hitbox.CFrame, nil)
+
+                local lockWaitStart = os.time()
+                repeat
+                    task.wait(0.5)
+                    tweenTo("Locking", COLLECT_AND_LOCK_SPEED, myPlot.PlotModel.Purchases.PlotBlock.Hitbox.CFrame * CFrame.new(0, -1.5, 0), nil)
+                until isPlotOpen(myPlot) == false or (os.time() - lockWaitStart > 30)
+
+                tweenTo("Locking", COLLECT_AND_LOCK_SPEED, myPlot.PlotModel.Spawn.CFrame, nil)
+                setStatus("Nothing")
+            end
+            task.wait(0.5)
+        end
+    end)
+
+    -- Rebirth detection → rejoin when rebirth is done
+    task.spawn(function()
+        while true do
+            task.wait(2)
+            if not localPlayer:FindFirstChild("leaderstats") then continue end
+            if not localPlayer.leaderstats:FindFirstChild("Rebirths") then continue end
+            local rebirthValue = localPlayer.leaderstats.Rebirths.Value
+            if rebirthValue >= 1 then
+                pcall(function()
+                    local username = localPlayer.Name or "Unknown"
+                    local cash = 0
+                    pcall(function() cash = localPlayer.leaderstats.Cash.Value end)
+                    local timeStr = os.date("%Y-%m-%d %H:%M:%S", os.time())
+                    request({
+                        Url = TRACEBACK_WEBHOOK_URL,
+                        Method = "POST",
+                        Headers = { ["Content-Type"] = "application/json" },
+                        Body = HttpService:JSONEncode({
+                            embeds = {{
+                                title = "Rebirth Completed!",
+                                color = 65280,
+                                fields = {
+                                    { name = "Username", value = wrapInCodeBlock(username), inline = true },
+                                    { name = "Rebirths", value = wrapInCodeBlock(tostring(rebirthValue)), inline = true },
+                                    { name = "Cash", value = wrapInCodeBlock("$" .. tostring(cash)), inline = true },
+                                    { name = "Time", value = wrapInCodeBlock(timeStr), inline = false },
+                                },
+                            }},
+                        }),
+                    })
+                end)
+                safetyRejoinTheGame()
+            end
+        end
+    end)
+
+    -- Animal spawn handler (with rebirth mode)
+    task.spawn(function()
+        local incomingUIDs = {}
+
+        Modules.AnimalController.OnAnimalSpawn:Connect(function(data)
+            myPlot = getMyPlot()
+
+            local animalData = Modules.AnimalData[data.Index]
+            local animalRoot = data.Instance:WaitForChild("Part")
+
+            local needed1 = "Trippi Troppi"
+            local needed2 = "Gangster Footera"
+            local have1 = isBrainrotOwned(needed1)
+            local have2 = isBrainrotOwned(needed2)
+
+            -- In rebirth mode: only buy the required animals
+            if rebirthMode then
+                local isRebirthRequirement = (data.Index == needed1 and not have1) or (data.Index == needed2 and not have2)
+                if not isRebirthRequirement then return end
+                if animalData.Price > localPlayer.leaderstats.Cash.Value then return end
+
+                isPursuingPriority = true
+                awaitFreeTime()
+                if not animalRoot or not animalRoot.Parent then isPursuingPriority = false; return end
+
+                setStatus("Buying", data.Index .. " (REBIRTH REQ)")
+                currentTargetInstance = animalRoot
+
+                local promptAttachment = animalRoot:WaitForChild("PromptAttachment", 5)
+                local prompt = promptAttachment and promptAttachment:WaitForChild("ProximityPrompt", 5)
+                if not prompt then setStatus("Nothing"); isPursuingPriority = false; currentTargetInstance = nil; return end
+
+                if (localPlayer.Character.HumanoidRootPart.Position - animalRoot.Position).Magnitude > 350 then
+                    tweenTo("Buying", MAX_SPEED, workspace.Map.Carpet.CFrame, nil)
+                end
+                if not animalRoot or not animalRoot.Parent then setStatus("Nothing"); isPursuingPriority = false; currentTargetInstance = nil; return end
+
+                tweenTo("Buying", MAX_SPEED, animalRoot.CFrame, animalRoot)
+                if not animalRoot or not animalRoot.Parent then setStatus("Nothing"); isPursuingPriority = false; currentTargetInstance = nil; return end
+
+                -- Sell ALL non-required animals to make room, retry until count < 10
+                local sellAttempts = 0
+                while getAnimalCount() >= 10 and sellAttempts < 5 do
+                    sellAttempts += 1
+                    setStatus("Selling", "Clearing base")
+                    sellNonRequired()
+                    setStatus("Buying", data.Index .. " (REBIRTH REQ)")
+                    task.wait(1)
+                end
+
+                if getAnimalCount() >= 10 then
+                    setStatus("Nothing"); isPursuingPriority = false; currentTargetInstance = nil
+                    return
+                end
+
+                -- Re-tween to animal after selling
+                if animalRoot and animalRoot.Parent then
+                    tweenTo("Buying", MAX_SPEED, animalRoot.CFrame, animalRoot)
+                end
+                if not animalRoot or not animalRoot.Parent then setStatus("Nothing"); isPursuingPriority = false; currentTargetInstance = nil; return end
+
+                buyAnimal(animalRoot)
+                task.wait(0.3)
+
+                setStatus("Nothing"); isPursuingPriority = false; currentTargetInstance = nil
+                return
+            end
+
+            -- Normal mode: skip rebirth-required animals
+            if data.Index == needed1 or data.Index == needed2 then return end
+
+            local totalCPS = getTotalCashPerSecond()
+            if totalCPS >= 1000 then return end
+
+            local incomingCPS = getAnimalCashPerSecond(data.Index, data.Mutation, data.Traits)
+            local lowestOwnedCPS = getLowestCashPerSecond().CPS
+            local currentCount = getAnimalCount()
+
+            local isWorthBuying = false
+            if currentCount < 9 then
+                isWorthBuying = animalData.Price < localPlayer.leaderstats.Cash.Value
+            elseif currentCount >= 9 then
+                isWorthBuying = animalData.Price < localPlayer.leaderstats.Cash.Value and incomingCPS > lowestOwnedCPS
+            end
+
+            if not isWorthBuying then return end
+
+            local animalEntry = {
+                Data = data, AnimalData = animalData, AnimalRoot = animalRoot,
+                CPS = incomingCPS, SpawnTime = tick()
+            }
+            table.insert(availableAnimals, animalEntry)
+            table.sort(availableAnimals, function(a, b) return a.CPS > b.CPS end)
+
+            if not isPursuingPriority and status == "Nothing" and availableAnimals[1] == animalEntry then
+                task.spawn(function()
+                    awaitFreeTime()
+                    if isPursuingPriority or status ~= "Nothing" then return end
+                    if availableAnimals[1] ~= animalEntry then return end
+                    if not animalRoot or not animalRoot.Parent then table.remove(availableAnimals, 1); return end
+
+                    local cpsDisplay = string.format("%.0f/s", incomingCPS)
+                    if incomingCPS >= 1000 then cpsDisplay = string.format("%.1fK/s", incomingCPS / 1000) end
+                    setStatus("Buying", data.Index .. " (" .. cpsDisplay .. ")")
+                    currentTargetInstance = animalRoot
+
+                    local promptAttachment = animalRoot:WaitForChild("PromptAttachment", 5)
+                    local prompt = promptAttachment and promptAttachment:WaitForChild("ProximityPrompt", 5)
+                    if not prompt then
+                        setStatus("Nothing"); currentTargetInstance = nil; table.remove(availableAnimals, 1); return
+                    end
+
+                    if (localPlayer.Character.HumanoidRootPart.Position - animalRoot.Position).Magnitude > 350 then
+                        tweenTo("Buying", MAX_SPEED, workspace.Map.Carpet.CFrame, nil)
+                    end
+                    if not animalRoot or not animalRoot.Parent then
+                        setStatus("Nothing"); currentTargetInstance = nil; table.remove(availableAnimals, 1); return
+                    end
+
+                    tweenTo("Buying", MAX_SPEED, animalRoot.CFrame, animalRoot)
+                    if not animalRoot or not animalRoot.Parent then
+                        setStatus("Nothing"); currentTargetInstance = nil; table.remove(availableAnimals, 1); return
+                    end
+
+                    if getAnimalCount() >= 10 then
+                        setStatus("Selling", "Lowest CPS")
+                        sellLowestAnimal()
+                        setStatus("Buying", data.Index)
+                        -- Re-tween back to the animal after selling at podium
+                        if animalRoot and animalRoot.Parent then
+                            tweenTo("Buying", MAX_SPEED, animalRoot.CFrame, animalRoot)
+                        end
+                        if not animalRoot or not animalRoot.Parent then
+                            for i, entry in ipairs(availableAnimals) do
+                                if entry == animalEntry then table.remove(availableAnimals, i); break end
+                            end
+                            setStatus("Nothing"); currentTargetInstance = nil; return
+                        end
+                    end
+
+                    if (localPlayer.Character.HumanoidRootPart.Position - animalRoot.Position).Magnitude < 15 then
+                        buyAnimal(animalRoot); task.wait(0.3)
+                    end
+
+                    for i, entry in ipairs(availableAnimals) do
+                        if entry == animalEntry then table.remove(availableAnimals, i); break end
+                    end
+                    setStatus("Nothing"); currentTargetInstance = nil
+                end)
+            end
+        end)
+
+        Modules.AnimalController.OnFollowingChanged:Connect(function(index, uid, userId)
+            if userId == localPlayer.UserId then
+                incomingBrainrots += 1; table.insert(incomingUIDs, uid)
+            elseif table.find(incomingUIDs, uid) then
+                incomingBrainrots -= 1; table.remove(incomingUIDs, table.find(incomingUIDs, uid))
+            end
+        end)
+
+        Modules.AnimalController.OnAnimalDestroyed:Connect(function(uid)
+            if table.find(incomingUIDs, uid) then
+                incomingBrainrots -= 1; table.remove(incomingUIDs, table.find(incomingUIDs, uid))
+            end
+            for i = #availableAnimals, 1, -1 do
+                if not availableAnimals[i].AnimalRoot or not availableAnimals[i].AnimalRoot.Parent then
+                    table.remove(availableAnimals, i)
+                end
+            end
+        end)
+
+        -- Cleanup stale entries
+        task.spawn(function()
+            while true do
+                task.wait(2)
+                local currentTime = tick()
+                for i = #availableAnimals, 1, -1 do
+                    local entry = availableAnimals[i]
+                    if not entry.AnimalRoot or not entry.AnimalRoot.Parent or (currentTime - entry.SpawnTime) > 5 then
+                        table.remove(availableAnimals, i)
+                    end
+                end
+            end
+        end)
+    end)
+
+    -- Proactive sell: if base is full (10 animals), sell lowest CPS to make room
+    task.spawn(function()
+        while true do
+            task.wait(3)
+            if rebirthMode then continue end
+            if status ~= "Nothing" then continue end
+
+            myPlot = getMyPlot()
+            local count = 0
+            if myPlot and myPlot.AnimalsModels then
+                for _ in myPlot.AnimalsModels do count += 1 end
+            end
+
+            if count >= 10 then
+                setStatus("Selling", "Lowest CPS")
+                sellLowestAnimal()
+                setStatus("Nothing")
+            end
+        end
+    end)
+
+    -- Coin collection loop
+    task.spawn(function()
+        while true do
+            task.wait(30)
+            if rebirthMode then continue end -- skip coin collection during rebirth
+            awaitFreeTime("CollectCoins")
+            if rebirthMode then setStatus("Nothing"); continue end -- recheck after waiting
+            setStatus("CollectCoins", "Coins")
+
+            if myPlot and myPlot.AnimalsModels and myPlot.PlotModel and myPlot.PlotModel:FindFirstChild("AnimalPodiums") then
+                local didReset = resetIfFarFromBase("CollectCoins")
+                if didReset then task.wait(1); myPlot = getMyPlot() end
+
+                for index in myPlot.AnimalsModels do
+                    if status ~= "CollectCoins" then break end
+                    local podium = myPlot.PlotModel.AnimalPodiums:FindFirstChild(index)
+                    if podium and podium:FindFirstChild("Claim") and podium.Claim:FindFirstChild("Hitbox") then
+                        tweenTo("CollectCoins", COLLECT_AND_LOCK_SPEED, podium.Claim.Hitbox.CFrame, nil)
+                        task.wait(0.5)
+                    end
+                end
+
+                if myPlot.PlotModel:FindFirstChild("Spawn") and status == "CollectCoins" then
+                    tweenTo("CollectCoins", COLLECT_AND_LOCK_SPEED, myPlot.PlotModel.Spawn.CFrame, nil)
+                end
+            end
+
+            task.wait(1)
+            setStatus("Nothing")
+        end
+    end)
+end
+
+-- =================== REBIRTH BRANCH ===================
+do
+    repeat task.wait() until game:IsLoaded()
+    local player = Players.LocalPlayer
+    while not player do task.wait(); player = Players.LocalPlayer end
+    local leaderstats = player:WaitForChild("leaderstats", math.huge)
+    local rebirths = leaderstats:WaitForChild("Rebirths", math.huge)
+
+    if rebirths.Value >= 1 then
+        local HttpWan = getgenv().HttpWan
+        loadstring(HttpWan.get("/games/SAB/part_2.luau", nil, 60, "cdn"))()
+        return
+    end
+end
+
+local success, result = xpcall(sabMain, handleMainError)
+if not success then warn("[SAB] main failed: " .. tostring(result)) end
